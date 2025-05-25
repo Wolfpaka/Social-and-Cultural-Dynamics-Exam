@@ -1,0 +1,965 @@
+---
+title: "Social Cognition Networks" # Revised title
+author: "Christian"
+date: "2025-05-07" 
+output: html_document
+---
+
+# Setting everything up.
+
+```{r setup_chunk, echo=TRUE}
+# Ensure output is shown in the rendered document
+knitr::opts_chunk$set(echo = TRUE) 
+
+# Load necessary libraries
+library(tidyverse)
+library(qgraph)
+library(corpcor) 
+library(bootnet)
+library(NetworkComparisonTest) # Added here for Step 5
+library(huge)
+
+# Load data
+scope <- read_csv("scope_working.csv")
+
+# Define GROUP factor levels and labels
+scope$GROUP <- factor(scope$GROUP, levels = c(0, 1, 2), 
+                      labels = c("Controls", "Schizophrenia", "ASD"))
+
+# Create dataset excluding the "Controls" group
+scope_no_TD <- scope %>% 
+  filter(GROUP != "Controls") 
+
+# Load custom analysis functions (Make sure this file is in your working directory or path)
+# Ensure analysis_functions.R does not have hardcoded assumptions if it's used for plotting beyond qgraph's defaults
+# For this script, we primarily use qgraph and bootnet's plotting which adapt to the data.
+# source("analysis_functions.R")
+
+source("checking for normality.R")
+```
+
+# Step 1. Check NA counts for potential variables in the clinical groups
+
+```{r check_na_counts}
+# Define the columns (potential metrics) to check for NAs 
+# (Excluding GROUP; Gender is excluded from the analysis pipeline)
+columns_to_check_na <- c(
+  "PANSS1_pos_total", "PANSS1_neg_total", "PS1_Tot", "TrailsA", "Symb_code",
+  "HVLT_Avg", "LNS", "AF", "BLERT1_Tot", "ER40_A_Total", "TASIT_TOTAL",
+  "SSPA_tot_avg", "UPSA_Tot", "CToM_Tot", "RAD1_Tot", "Eyes1_Tot",
+  "Trust_AVG", "Age", "AIHQ_Blame", "AIHQ_Hostility", "AIHQ_Aggression" 
+)
+
+# Group the non-control data by GROUP and summarise NA counts for each column
+TOTAL_SCORES_NA_by_GROUP <- scope_no_TD %>%
+  group_by(GROUP) %>%
+  summarise(across(all_of(columns_to_check_na), 
+                   ~ sum(is.na(.)), 
+                   .names = "NA_{col}")) %>%
+  ungroup() 
+
+print(TOTAL_SCORES_NA_by_GROUP)
+```
+
+# Step 2. Prepare and Standardize Data for Network Analysis
+
+```{r prepare_data}
+# Define the specific CONTINUOUS/ORDINAL columns to standardize for the network
+# Age is included. Gender is excluded from this list and subsequent data.
+columns_to_standardize <- c(
+  "PANSS1_pos_total", "PANSS1_neg_total", "PS1_Tot", "TrailsA", "Symb_code",
+  "HVLT_Avg", "LNS", "AF", "BLERT1_Tot", "ER40_A_Total", "TASIT_TOTAL",
+  "SSPA_tot_avg", "UPSA_Tot", "RAD1_Tot", "Eyes1_Tot",
+  "Trust_AVG", "Age", "AIHQ_Blame", "AIHQ_Hostility", "AIHQ_Aggression"
+) # 20 variables to standardize
+
+# Select relevant columns (standardized variables + GROUP), 
+# remove rows with any NAs in these columns, 
+# and standardize ONLY the specified numeric columns. 
+TOTAL_SCORES_final <- scope_no_TD %>%
+  select(all_of(columns_to_standardize), GROUP) %>% 
+  drop_na() %>%                                     
+  mutate(across(all_of(columns_to_standardize),     
+                ~ as.numeric(scale(.))))             
+
+# Optional: Check dimensions or summary of the final data
+print(paste("Dimensions of TOTAL_SCORES_final:", paste(dim(TOTAL_SCORES_final), collapse = "x")))
+# summary(TOTAL_SCORES_final) 
+# str(TOTAL_SCORES_final)
+
+```
+
+# Step 3. Define Node Labels and Variables
+
+```{r define_labels_vars}
+# Define node labels for the plot (17 labels)
+my_node_labels <- c("PS", "TMT", "SC", 
+  "HVLT", "LNS", "AF", "BLERT", "TASIT", 
+  "SSPA", "UPSA", "RAD", "Eyes", 
+  "Trust", 
+  "Age", "Blame"
+) # Total 20 labels
+
+# Define the variables for the network (all columns in TOTAL_SCORES_final except GROUP)
+network_vars <- colnames(TOTAL_SCORES_final)[colnames(TOTAL_SCORES_final) != "GROUP"]
+
+# Check if number of labels matches number of variables
+if(length(my_node_labels) != length(network_vars)) {
+  warning(paste0("Mismatch between the number of node labels provided (", length(my_node_labels), 
+                 ") and the number of variables selected for the network (", length(network_vars), 
+                 "). Labels may be incorrect or plotting might fail."))
+} else {
+   message(paste("Correct number of labels (", length(my_node_labels), 
+                 ") provided for the ", length(network_vars), " network variables."))
+}
+
+# Create directory for images if it doesn't exist
+if (!dir.exists("psychometric network images/Total_scores")) {
+  dir.create("psychometric network images/Total_scores", recursive = TRUE)
+}
+if (!dir.exists("psychometric network images/Bootstrapping")) { # Ensure Bootstrapping directory also exists
+  dir.create("psychometric network images/Bootstrapping", recursive = TRUE)
+}
+
+# (This code goes in the R chunk for Step 3b, before the plot() commands)
+
+# Define the groups for each variable in the order of 'columns_to_standardize'
+# Ensure network_vars is defined as in your script:
+# network_vars <- colnames(TOTAL_SCORES_final)[colnames(TOTAL_SCORES_final) != "GROUP"]
+
+# Create a named list for easier mapping from full variable names to categories
+# (This helps ensure the order is correct if columns_to_standardize changes, but direct assignment below is also fine if order is stable)
+category_map <- list(
+  "PS1_Tot" = "Symptom Severity",
+  "TrailsA" = "Neurocognition", 
+  "Symb_code" = "Neurocognition", 
+  "HVLT_Avg" = "Neurocognition", 
+  "LNS" = "Neurocognition", 
+  "AF" = "Neurocognition",
+  "BLERT1_Tot" = "Emotion Recognition", 
+  "TASIT_TOTAL" = "Mental State Attribution",
+  "SSPA_tot_avg" = "Social Skills/Functioning", 
+  "UPSA_Tot" = "Social Skills/Functioning",
+  "RAD1_Tot" = "Social Perception",
+  "Eyes1_Tot" = "Mental State Attribution",
+  "Trust_AVG" = "Other", 
+  "Age" = "Other",
+  "AIHQ_Blame" = "Attributional Style"
+)
+
+# Create the factor for the 'groups' argument, ensuring the order matches network_vars
+# The levels argument defines the order for the legend and default color assignment
+variable_groups <- factor(unlist(category_map[network_vars]), 
+                          levels = c("Symptom Severity", "Neurocognition", "Emotion Recognition", 
+                                     "Mental State Attribution", "Social Perception", 
+                                     "Social Skills/Functioning", "Attributional Style", "Other"))
+
+group_colors <- c(
+  "Symptom Severity" = "#E41A1C",  # Red
+  "Neurocognition" = "#377EB8",    # Blue
+  "Emotion Recognition" = "#4DAF4A",# Green
+  "Mental State Attribution" = "#984EA3",# Purple
+  "Social Perception" = "#FF7F00", # Orange
+  "Social Skills/Functioning" = "#FFFF33",# Yellow (may need black text if too light)
+  "Attributional Style" = "#A65628", # Brown
+  "Other" = "#F781BF" # Pink - This will replace the black for "Age" and "Trust"
+)
+
+# You can define specific colors for your groups if you don't like the defaults
+# Make sure the number of colors matches the number of levels in variable_groups
+# Example:
+# group_colors <- c("red", "blue", "green", "purple", "orange", "brown", "pink", "grey")
+
+ordered_group_colors <- group_colors[levels(variable_groups)]
+```
+
+# Step 4. Transforming data that isn't normally distributed
+```{r}
+# Split the final data by group
+Data_SCZ <- TOTAL_SCORES_final %>%
+  filter(GROUP == "Schizophrenia") %>%
+  select(-GROUP) # Remove the group column for estimation
+
+Data_ASD <- TOTAL_SCORES_final %>%
+  filter(GROUP == "ASD") %>%
+  select(-GROUP) # Remove the group column for estimation
+
+# check_all_columns_normality(Data_SCZ, "Schizophrenia")
+
+# This is the new section you'll add or modify
+
+# Create copies of your dataframes to store the prepared (potentially transformed) data
+Data_SCZ_prepared <- Data_SCZ
+Data_ASD_prepared <- Data_ASD
+
+# !!! USER ACTION REQUIRED: Define these lists based on your normality checks !!!
+# List of *continuous* column names that were found to be *non-normal* in Data_SCZ
+# Example: columns_to_transform_scz <- c("Age", "TrailsA_raw_score") # REPLACE WITH YOUR ACTUAL COLUMN NAMES
+columns_to_transform_scz <- c(
+    "PANSS1_pos_total",  "PANSS1_neg_total",  "PS1_Tot", "TrailsA",           
+    "HVLT_Avg", "AF","BLERT1_Tot","ER40_A_Total","TASIT_TOTAL",       
+    "SSPA_tot_avg","UPSA_Tot","Eyes1_Tot","Trust_AVG",         
+    "Age","AIHQ_Hostility","AIHQ_Aggression"    
+) # e.g., c("Age", "PANSS1_pos_total") - FILL THIS IN
+
+# List of *continuous* column names that were found to be *non-normal* in Data_ASD
+# Example: columns_to_transform_asd <- c("Age", "Another_Continuous_Var") # REPLACE WITH YOUR ACTUAL COLUMN NAMES
+columns_to_transform_asd <- c(
+  "PANSS1_pos_total", "PANSS1_neg_total", "PS1_Tot", "TrailsA", 
+  "HVLT_Avg", "BLERT1_Tot", "ER40_A_Total", "TASIT_TOTAL", 
+  "SSPA_tot_avg", "UPSA_Tot", "RAD1_Tot", "Eyes1_Tot", 
+  "Trust_AVG", "Age", "AIHQ_Blame", "AIHQ_Hostility", "AIHQ_Aggression"
+) # e.g., c("Age", "PANSS1_pos_total") - FILL THIS IN
+
+
+# Apply nonparanormal transformation to specified SCZ columns
+if (length(columns_to_transform_scz) > 0) {
+  message("Applying nonparanormal transformation to specified SCZ columns...")
+  for (col_name in columns_to_transform_scz) {
+    if (col_name %in% names(Data_SCZ_prepared)) {
+      message(paste("Transforming SCZ column:", col_name))
+      # huge.npn expects a matrix or data.frame; use as.data.frame for a single column
+      # npn.func can be "shrinkage" (default) or "truncation"
+      transformed_data <- huge.npn(as.data.frame(Data_SCZ_prepared[[col_name]]), npn.func = "shrinkage")
+      Data_SCZ_prepared[[col_name]] <- transformed_data[,1] # huge.npn returns a data.frame/matrix
+    } else {
+      warning(paste("Column '", col_name, "' not found in Data_SCZ. Skipping transformation for this column."))
+    }
+  }
+} else {
+  message("No columns specified for nonparanormal transformation in Data_SCZ.")
+}
+
+# Apply nonparanormal transformation to specified ASD columns
+if (length(columns_to_transform_asd) > 0) {
+  message("Applying nonparanormal transformation to specified ASD columns...")
+  for (col_name in columns_to_transform_asd) {
+    if (col_name %in% names(Data_ASD_prepared)) {
+      message(paste("Transforming ASD column:", col_name))
+      transformed_data <- huge.npn(as.data.frame(Data_ASD_prepared[[col_name]]), npn.func = "shrinkage")
+      Data_ASD_prepared[[col_name]] <- transformed_data[,1]
+    } else {
+      warning(paste("Column '", col_name, "' not found in Data_ASD. Skipping transformation for this column."))
+    }
+  }
+} else {
+  message("No columns specified for nonparanormal transformation in Data_ASD.")
+}
+```
+
+
+```{r}
+Data_ASD_prepared <- Data_ASD_prepared %>%  select(-PANSS1_pos_total, -PANSS1_neg_total, -ER40_A_Total, -AIHQ_Aggression, -AIHQ_Hostility)
+
+Data_SCZ_prepared <- Data_SCZ_prepared %>%  select(-PANSS1_pos_total, -PANSS1_neg_total, -ER40_A_Total, -AIHQ_Aggression, -AIHQ_Hostility)
+```
+
+# Step 5. Estimate and Plot Separate Networks
+
+```{r estimate_plot_networks}
+
+# Estimate network for SCZ group
+set.seed(1) # For reproducibility
+network_SCZ <- estimateNetwork(Data_SCZ_prepared,
+                               default = "EBICglasso",
+                               corMethod = "cor_auto",
+                               tuning = 0.25)
+
+# Estimate network for ASD group
+set.seed(2) # For reproducibility
+network_ASD <- estimateNetwork(Data_ASD_prepared,
+                               default = "EBICglasso",
+                               corMethod = "cor_auto",
+                               tuning = 0.25)
+
+# Calculate the average layout based on both estimated networks
+common_layout <- averageLayout(network_SCZ$graph, network_ASD$graph, layout = "spring")
+
+# --- Calculate a common maximum value for edge scaling ---
+# Find the maximum absolute edge weight across both networks
+max_abs_edge <- max(abs(network_SCZ$graph), abs(network_ASD$graph), na.rm = TRUE)
+# Use this max value for consistent scaling in plots
+max_val_for_plot <- max_abs_edge
+# Optional: print the max value to know what it is
+print(paste("Maximum absolute edge weight for scaling:", round(max_val_for_plot, 3)))
+# --- End of maximum value calculation ---
+
+# --- Plot Both Networks Side-by-Side in One PDF ---
+# Adjust width for two plots, height might need slight increase for titles/details
+pdf("psychometric network images/Total_scores/Total_scores_SCZ_ASD_SideBySide.pdf", width = 11, height = 6)
+
+# Set plotting area to 1 row, 2 columns
+par(mfrow = c(1, 2))
+
+# Plot SCZ network (Left Side)
+plot(network_SCZ,
+     layout = common_layout,
+     title = "SCZ Network (Gamma = 0.25)",
+     vsize = 6,
+     minimum = 0,
+     cut = 0,
+     maximum = max_val_for_plot,
+     # theme = "colorblind", # Using explicit colors might mean you don't need/want a theme, or test for compatibility
+     labels = my_node_labels,
+     groups = variable_groups,
+     color = ordered_group_colors, # MODIFIED: Use your defined colors
+     legend = FALSE,
+     details = TRUE,
+     edge.labels = TRUE,
+     edge.label.cex = 0.6,
+     edge.label.digits = 2
+     )
+
+# Plot ASD network (Right Side)
+plot(network_ASD,
+     layout = common_layout,
+     title = "ASD Network (Gamma = 0.25)",
+     vsize = 6,
+     minimum = 0,
+     cut = 0,
+     maximum = max_val_for_plot,
+     # theme = "colorblind", # Using explicit colors might mean you don't need/want a theme
+     labels = my_node_labels,
+     groups = variable_groups,
+     color = ordered_group_colors, # MODIFIED: Use your defined colors
+     legend = TRUE,
+     legend.cex = 0.35,
+     details = TRUE,
+     edge.labels = TRUE,
+     edge.label.cex = 0.6,
+     edge.label.digits = 2
+     )
+
+# Reset plotting layout to default (1 plot per page) - good practice
+par(mfrow = c(1, 1))
+
+dev.off()
+# --- End of Side-by-Side Plotting ---
+
+message("Side-by-side network plot (SCZ and ASD) saved.")
+```
+
+# Step 6. Assess Network Stability using Bootstrapping
+
+```{r assess_stability}
+# Define file paths for saved bootstrap objects
+# It's good practice to store these in a dedicated subfolder if you have many
+bootstrap_dir <- "psychometric network images/Bootstrapping/RDS_objects"
+if (!dir.exists(bootstrap_dir)) {
+  dir.create(bootstrap_dir, recursive = TRUE)
+}
+
+file_boot_SCZ_edges_cent <- file.path(bootstrap_dir, "boot_SCZ_edges_and_centrality.RDS")
+file_boot_ASD_edges_cent <- file.path(bootstrap_dir, "boot_ASD_edges_and_centrality.RDS")
+file_boot_SCZ_cent_order <- file.path(bootstrap_dir, "boot_SCZ_centrality_order.RDS")
+file_boot_ASD_cent_order <- file.path(bootstrap_dir, "boot_ASD_centrality_order.RDS")
+
+# --- Stability Assessment for SCZ Network ---
+
+# 1. Non-parametric bootstrap for edge weight ACCURACY & CENTRALITY PRECISION
+if (file.exists(file_boot_SCZ_edges_cent)) {
+  message(paste("Loading previously computed SCZ non-parametric bootstrap from:", file_boot_SCZ_edges_cent))
+  boot_SCZ_edges_and_centrality <- readRDS(file_boot_SCZ_edges_cent)
+} else {
+  message("Computing SCZ non-parametric bootstrap (edges and centrality)... This may take some time.")
+  set.seed(123) # Use the same seed as before for reproducibility
+  boot_SCZ_edges_and_centrality <- bootnet(network_SCZ,
+                                           nBoots = 1000,
+                                           type = "nonparametric",
+                                           statistics = c("edge", "strength", "closeness", "betweenness"), # Explicitly request centrality
+                                           nCores = 6)
+  saveRDS(boot_SCZ_edges_and_centrality, file = file_boot_SCZ_edges_cent)
+  message(paste("SCZ non-parametric bootstrap results saved to:", file_boot_SCZ_edges_cent))
+}
+
+# --- Plotting Centrality Estimates (Sample vs. Bootstrap with CIs) ---
+# Shows sample estimate (red) and 95% CI from bootstrap (gray area), with bootstrap mean (blue).
+pdf("psychometric network images/Bootstrapping/Centrality_Estimates_SCZ.pdf", width = 7, height = 6) # Increased height slightly for labels
+plot(boot_SCZ_edges_and_centrality, 
+     statistics = c("strength", "closeness", "betweenness"), 
+     plot = "area", 
+     order = "id", 
+     labels = my_node_labels, # This is correct for plot = "area"
+     legend = TRUE, 
+     color = c("red", "blue"), 
+     fill = "grey80", 
+     # alpha = 0.7, # Removed: alpha argument not used for plot = "area"
+     main = "Centrality Estimates with 95% CIs (SCZ Group)")
+dev.off()
+
+# --- Plotting Centrality Difference Tests (Within SCZ Network) ---
+# Shows if centrality values of different nodes are significantly different from each other.
+pdf("psychometric network images/Bootstrapping/Centrality_Difference_Test_SCZ.pdf", width = 8, height = 7) # Adjusted size
+plot(boot_SCZ_edges_and_centrality, 
+     plot = "difference",
+     statistics = "strength", # Example for strength, repeat for closeness, betweenness if desired
+     order = "sample",
+     onlyNonZero = FALSE, # Show all comparisons
+     labels = TRUE, # MODIFIED: For plot="difference", TRUE uses node names from the object
+     construct = "Strength", # Label for the plot
+     main = "Strength Centrality Difference Test (SCZ Group)")
+# You can create similar plots for "closeness" and "betweenness" by changing the 'statistics' and 'construct' arguments.
+dev.off()
+
+
+# --- Stability Assessment for ASD Network ---
+if (file.exists(file_boot_ASD_edges_cent)) {
+  message(paste("Loading previously computed ASD non-parametric bootstrap from:", file_boot_ASD_edges_cent))
+  boot_ASD_edges_and_centrality <- readRDS(file_boot_ASD_edges_cent)
+} else {
+  message("Computing ASD non-parametric bootstrap (edges and centrality)... This may take some time.")
+  set.seed(789) # Use the same seed as before for reproducibility
+  boot_ASD_edges_and_centrality <- bootnet(network_ASD,
+                                           nBoots = 1000,
+                                           type = "nonparametric",
+                                           statistics = c("edge", "strength", "closeness", "betweenness"), 
+                                           nCores = 6)
+  saveRDS(boot_ASD_edges_and_centrality, file = file_boot_ASD_edges_cent)
+  message(paste("ASD non-parametric bootstrap results saved to:", file_boot_ASD_edges_cent))
+}
+
+pdf("psychometric network images/Bootstrapping/Centrality_Estimates_ASD.pdf", width = 7, height = 6) # Increased height slightly for labels
+plot(boot_ASD_edges_and_centrality, 
+     statistics = c("strength", "closeness", "betweenness"), 
+     plot = "area",
+     order = "id",
+     labels = my_node_labels, # This is correct for plot = "area"
+     legend = TRUE,
+     color = c("red", "blue"),
+     fill = "grey80",
+     # alpha = 0.7, # Removed: alpha argument not used for plot = "area"
+     main = "Centrality Estimates with 95% CIs (ASD Group)")
+dev.off()
+
+# --- Plotting Centrality Difference Tests (Within ASD Network) ---
+pdf("psychometric network images/Bootstrapping/Centrality_Difference_Test_ASD.pdf", width = 8, height = 7) # Adjusted size
+plot(boot_ASD_edges_and_centrality, 
+     plot = "difference",
+     statistics = "strength", # Example for strength
+     order = "sample",
+     onlyNonZero = FALSE,
+     labels = TRUE, # MODIFIED: For plot="difference", TRUE uses node names from the object
+     construct = "Strength",
+     main = "Strength Centrality Difference Test (ASD Group)")
+# You can create similar plots for "closeness" and "betweenness".
+dev.off()
+
+message("Centrality estimate plots (sample vs. bootstrap CIs) and difference tests saved.")
+
+# --- Case-Dropping Bootstrap for Centrality ORDER Stability ---
+# SCZ Group
+if (file.exists(file_boot_SCZ_cent_order)) {
+  message(paste("Loading previously computed SCZ case-dropping bootstrap from:", file_boot_SCZ_cent_order))
+  boot_SCZ_centrality_order <- readRDS(file_boot_SCZ_cent_order)
+} else {
+  message("Computing SCZ case-dropping bootstrap (centrality order)... This may take some time.")
+  set.seed(456)
+  boot_SCZ_centrality_order <- bootnet(network_SCZ, 
+                                       nBoots = 1000,
+                                       type = "case",
+                                       nCores = 6,
+                                       statistics = c("strength", "closeness", "betweenness"))
+  saveRDS(boot_SCZ_centrality_order, file = file_boot_SCZ_cent_order)
+  message(paste("SCZ case-dropping bootstrap results saved to:", file_boot_SCZ_cent_order))
+}
+
+pdf("psychometric network images/Bootstrapping/Centrality_Order_Stability_SCZ.pdf", width = 6, height = 5)
+plot(boot_SCZ_centrality_order, 
+     statistics = c("strength", "closeness", "betweenness"),
+     main = "Centrality Order Stability (SCZ)")
+dev.off()
+
+cs_SCZ <- corStability(boot_SCZ_centrality_order)
+print("CS Coefficient (SCZ - Order Stability):")
+print(cs_SCZ)
+
+# ASD Group
+if (file.exists(file_boot_ASD_cent_order)) {
+  message(paste("Loading previously computed ASD case-dropping bootstrap from:", file_boot_ASD_cent_order))
+  boot_ASD_centrality_order <- readRDS(file_boot_ASD_cent_order)
+} else {
+  message("Computing ASD case-dropping bootstrap (centrality order)... This may take some time.")
+  set.seed(101)
+  boot_ASD_centrality_order <- bootnet(network_ASD, 
+                                       nBoots = 1000,
+                                       type = "case",
+                                       nCores = 6, 
+                                       statistics = c("strength", "closeness", "betweenness"))
+  saveRDS(boot_ASD_centrality_order, file = file_boot_ASD_cent_order)
+  message(paste("ASD case-dropping bootstrap results saved to:", file_boot_ASD_cent_order))
+}
+
+pdf("psychometric network images/Bootstrapping/Centrality_Order_Stability_ASD.pdf", width = 6, height = 5)
+plot(boot_ASD_centrality_order, 
+     statistics = c("strength", "closeness", "betweenness"),
+     main = "Centrality Order Stability (ASD)")
+dev.off()
+
+cs_ASD <- corStability(boot_ASD_centrality_order)
+print("CS Coefficient (ASD - Order Stability):")
+print(cs_ASD)
+
+message("Centrality order stability assessments completed and plots saved.")
+
+# --- Plotting Edge Weight Confidence Intervals Separately ---
+message("Plotting edge weight confidence intervals for SCZ and ASD networks in separate files...")
+
+# Adjust height for labels; width can be standard for a single plot.
+pdf_height <- 15 # Height for plot with labels
+pdf_width <- 8.5  # Width for a single plot (e.g., standard letter width)
+
+# --- Plot for SCZ Network ---
+pdf_file_scz <- "psychometric network images/Bootstrapping/Edge_Weight_CIs_SCZ.pdf"
+pdf(pdf_file_scz, width = pdf_width, height = pdf_height)
+
+# Plot SCZ Network
+plot(boot_SCZ_edges_and_centrality,
+     statistics = "edge",
+     plot = "interval",
+     order = "id",
+     labels = TRUE,    # Set to TRUE to attempt to show edge names.
+                       # This can be very cluttered.
+     legend = FALSE,
+     main = "SCZ Group: Edge Weights\n(Sample: Red, Bootstrap 95% CI: Grey)",
+     cex.axis = 0.7,   # Try reducing axis label font size if labels = TRUE
+     las = 1           # Makes y-axis labels horizontal
+     )
+dev.off()
+message(paste("SCZ edge weight CI plot saved to:", pdf_file_scz))
+
+# --- Plot for ASD Network ---
+pdf_file_asd <- "psychometric network images/Bootstrapping/Edge_Weight_CIs_ASD.pdf"
+pdf(pdf_file_asd, width = pdf_width, height = pdf_height)
+
+# Plot ASD Network
+plot(boot_ASD_edges_and_centrality,
+     statistics = "edge",
+     plot = "interval",
+     order = "id",
+     labels = TRUE,    # Set to TRUE to attempt to show edge names.
+     legend = FALSE,
+     main = "ASD Group: Edge Weights\n(Sample: Red, Bootstrap 95% CI: Grey)",
+     cex.axis = 0.7,   # Try reducing axis label font size
+     las = 1
+     )
+dev.off()
+message(paste("ASD edge weight CI plot saved to:", pdf_file_asd))
+
+# Reset plotting layout to default (good practice, though not strictly necessary here as each plot is in its own PDF scope)
+par(mfrow = c(1, 1), oma = c(0, 0, 0, 0))
+
+message("Separate edge weight CI plots saved.")
+```
+
+# Step 7. Compare SCZ and ASD Networks using Network Comparison Test (NCT)
+
+```{r}
+# Step 7. Compare SCZ and ASD Networks using Network Comparison Test (NCT)
+
+# Ensure necessary variables from previous steps are loaded/defined:
+# network_SCZ, network_ASD (estimated network objects)
+# network_vars (full variable names used in network estimation)
+# my_node_labels (shorter labels for plots and tables, corresponding to network_vars)
+
+# Create the node label map if it doesn't exist or needs to be re-established
+if (!exists("node_label_map") || !identical(names(node_label_map), network_vars) || !identical(unname(node_label_map), my_node_labels)) {
+  if (exists("network_vars") && exists("my_node_labels") && length(network_vars) == length(my_node_labels)) {
+    node_label_map <- setNames(my_node_labels, network_vars)
+    message("Node label map created/updated for NCT results.")
+  } else {
+    stop("CRITICAL ERROR: 'network_vars' or 'my_node_labels' not found or have mismatched lengths. Cannot create node_label_map. Please ensure they are correctly defined in Step 3 of your Rmd.")
+  }
+}
+
+# Define a filename for the saved NCT results
+nct_results_file <- "psychometric network images/Total_scores/NCT_results_SCZ_vs_ASD_full.RDS" # Updated filename
+
+# Check if the results file already exists
+if (file.exists(nct_results_file)) {
+  NCT_results <- readRDS(nct_results_file)
+  message("Loaded previously computed NCT results from: ", nct_results_file)
+} else {
+  message("NCT results file not found. Computing NCT for SCZ vs ASD... (This may take some time)")
+
+  set.seed(999) # For reproducibility of permutations
+
+  # Perform the Network Comparison Test
+  NCT_results <- NCT(
+    network_SCZ, network_ASD,
+    it = 1000, # Number of permutations
+    test.edges = TRUE, 
+    edges = "all", 
+    p.adjust.methods = "none", # As per your previous script
+    test.centrality = TRUE, 
+    centrality = c("strength", "closeness", "betweenness"),
+    nodes = "all" 
+  )
+
+  saveRDS(NCT_results, file = nct_results_file)
+  message("NCT results computed and saved to: ", nct_results_file)
+}
+
+# --- Interpret the NCT Results ---
+
+# 1. Invariant Global Strength Test (Overall Connectivity)
+print("--- Invariant Global Strength Test (Overall Connectivity) ---")
+if (!is.null(NCT_results$glstrinv.pval)) {
+  print(paste("Global strength for Network 1 (SCZ):", round(NCT_results$glstrinv.sep[1], 3)))
+  print(paste("Global strength for Network 2 (ASD):", round(NCT_results$glstrinv.sep[2], 3)))
+  print(paste("Test statistic (difference in global strength):", round(NCT_results$glstrinv.real, 3)))
+  print(paste("P-value for difference in overall connectivity:", round(NCT_results$glstrinv.pval, 3)))
+} else {
+  message("Invariant Global Strength test p-value not available in NCT_results.")
+}
+cat("\n") # Add a newline for better separation
+
+# 2. Omnibus Network Test (Invariant Network Structure)
+print("--- Omnibus Network Test (Differences in Overall Network Structure) ---")
+if (!is.null(NCT_results$nwinv.pval)) {
+  print(paste("Test statistic M (maximum edge difference):", round(NCT_results$nwinv.real, 3)))
+  print(paste("P-value for omnibus network test:", round(NCT_results$nwinv.pval, 3)))
+  if (NCT_results$nwinv.pval <= 0.05) {
+    message("The omnibus network test is significant, implying at least one edge differs between the networks.")
+  } else {
+    message("The omnibus network test is not significant at p <= 0.05.")
+  }
+} else {
+  message("Omnibus Network Test (Invariant Network Structure) p-value not available in NCT_results.")
+}
+cat("\n")
+
+# 3. Invariant Edge Strength Test (Local Differences)
+print("--- Invariant Edge Strength Test (Differences in Specific Edges / Local Differences) ---")
+if (!is.null(NCT_results$einv.pvals) && is.data.frame(NCT_results$einv.pvals)) {
+  edge_data <- NCT_results$einv.pvals
+
+  # Rename the p-value column if it's named "p-value" to "P_Value_Edge"
+  if ("p-value" %in% colnames(edge_data)) {
+    colnames(edge_data)[colnames(edge_data) == "p-value"] <- "P_Value_Edge"
+  } else if (!("P_Value_Edge" %in% colnames(edge_data))) {
+    warning("P-value column for edges not found with expected names ('p-value' or 'P_Value_Edge') in NCT_results$einv.pvals.")
+  }
+
+  # Map full variable names to custom node labels
+  edge_data$Var1_mapped <- node_label_map[as.character(edge_data$Var1)]
+  edge_data$Var2_mapped <- node_label_map[as.character(edge_data$Var2)]
+  
+  # Handle cases where mapping might result in NA (if a name wasn't in node_label_map)
+  edge_data$Var1_mapped[is.na(edge_data$Var1_mapped)] <- as.character(edge_data$Var1[is.na(edge_data$Var1_mapped)])
+  edge_data$Var2_mapped[is.na(edge_data$Var2_mapped)] <- as.character(edge_data$Var2[is.na(edge_data$Var2_mapped)])
+
+  if ("P_Value_Edge" %in% colnames(edge_data)) {
+    edge_differences_df <- data.frame(
+        Node1 = edge_data$Var1_mapped,
+        Node2 = edge_data$Var2_mapped,
+        P_Value = round(edge_data$P_Value_Edge, 3),
+        Test_Statistic_E = round(edge_data$"Test statistic E", 3) # Assuming this column name from your output
+    )
+    
+    edge_differences_df <- edge_differences_df[order(edge_differences_df$P_Value), ]
+
+    print("Top edge differences (sorted by p-value):")
+    print(head(edge_differences_df, 20)) # Show top 20, or adjust as needed
+    
+    # Note on interpretation based on omnibus test
+    if (!is.null(NCT_results$nwinv.pval) && NCT_results$nwinv.pval > 0.05) {
+        message("Note: The omnibus network test was not significant. Interpret individual edge differences with caution (as this is an exploratory analysis without prior hypotheses for specific edges).")
+    }
+
+  } else {
+    message("Cannot display edge differences as the p-value column for edges is missing after processing.")
+  }
+} else {
+  message("Invariant Edge Strength test p-values (NCT_results$einv.pvals) not available as a data.frame or is NULL.")
+}
+cat("\n")
+
+# 4. Invariant Node Centrality Test
+print("--- Invariant Node Centrality Test (Differences in Node Importance) ---")
+centrality_measures_to_test <- c("strength", "closeness", "betweenness")
+all_centrality_results_list <- list() # Renamed to avoid conflict if you use all_centrality_results elsewhere
+
+if (!is.null(NCT_results$diffcen.pval) && is.matrix(NCT_results$diffcen.pval)) {
+  centrality_pvalue_matrix <- NCT_results$diffcen.pval
+  full_node_names_from_output <- rownames(centrality_pvalue_matrix)
+  
+  # Use the already defined or created node_label_map
+  mapped_node_labels <- node_label_map[full_node_names_from_output]
+  mapped_node_labels[is.na(mapped_node_labels)] <- full_node_names_from_output[is.na(mapped_node_labels)]
+
+  for (measure in centrality_measures_to_test) {
+    if (measure %in% colnames(centrality_pvalue_matrix)) {
+      p_values_for_measure <- centrality_pvalue_matrix[, measure]
+      
+      # Also extract the real difference in centrality if available (e.g., from NCT_results$diffcen.real)
+      real_diff_centrality <- NA # Placeholder
+      if(!is.null(NCT_results$diffcen.real) && measure %in% colnames(NCT_results$diffcen.real)){
+          real_diff_centrality <- round(NCT_results$diffcen.real[, measure], 3)
+      }
+      
+      centrality_df <- data.frame(
+        Node = mapped_node_labels,
+        Centrality_Measure = toupper(measure),
+        Difference_Value = real_diff_centrality, # Value of (centrality_group1 - centrality_group2)
+        P_Value = round(p_values_for_measure, 3),
+        row.names = NULL
+      )
+      
+      centrality_df <- centrality_df[order(centrality_df$P_Value, na.last = TRUE), ]
+      
+      print(paste("Differences in Node", toupper(measure), "(sorted by p-value):"))
+      print(centrality_df)
+      all_centrality_results_list[[measure]] <- centrality_df
+      cat("\n")
+      
+    } else {
+      message(paste("Column for centrality measure '", measure, "' not found in NCT_results$diffcen.pval.", sep=""))
+    }
+  }
+} else {
+  message("Invariant Node Centrality p-value matrix (NCT_results$diffcen.pval) not found or is not a matrix.")
+  message("Please ensure 'test.centrality = TRUE' was used in the NCT call and inspect str(NCT_results).")
+}
+
+message("NCT analysis (Step 7) completed.")
+```
+
+# Step 8. Descriptive statistics
+
+```{r}
+# --- Load necessary libraries (if not already loaded in a previous chunk) ---
+library(tidyverse) # For dplyr, tidyr, etc.
+library(knitr)     # For kable table formatting
+
+# --- 1. Use the standardized dataset: TOTAL_SCORES_final ---
+# This dataframe is already standardized and has all exclusions applied.
+# 'columns_to_standardize' should contain the names of the variables in the network.
+# 'GROUP' is the grouping variable.
+# TOTAL_SCORES_final should be available from your "Step 2. Prepare and Standardize Data" chunk.
+# columns_to_standardize should be available from your "Step 2. Prepare and Standardize Data" chunk.
+# my_node_labels should be available from your "Step 3. Define Node Labels and Variables" chunk.
+
+
+# --- 2. Get Final Sample Sizes ---
+# These are the Ns for the groups that went into network estimation.
+# Ensure TOTAL_SCORES_final is loaded and contains the GROUP column
+if (!exists("TOTAL_SCORES_final") || !("GROUP" %in% names(TOTAL_SCORES_final))) {
+  stop("TOTAL_SCORES_final dataframe not found or does not contain GROUP column. Please ensure Step 2 has been run.")
+}
+
+final_n_SCZ_std <- TOTAL_SCORES_final %>%
+  filter(GROUP == "Schizophrenia") %>%
+  nrow()
+
+final_n_ASD_std <- TOTAL_SCORES_final %>%
+  filter(GROUP == "ASD") %>%
+  nrow()
+
+# --- 3. Calculate Descriptive Statistics (Means and SDs for standardized scores) ---
+# Ensure columns_to_standardize is loaded
+if (!exists("columns_to_standardize")) {
+  stop("columns_to_standardize vector not found. Please ensure Step 2 has been run.")
+}
+# Ensure all columns in columns_to_standardize exist in TOTAL_SCORES_final
+if (!all(columns_to_standardize %in% names(TOTAL_SCORES_final))) {
+  stop("Not all variables in 'columns_to_standardize' are present in 'TOTAL_SCORES_final'.")
+}
+
+
+descriptives_summary_std <- TOTAL_SCORES_final %>%
+  group_by(GROUP) %>%
+  # Summarise across all variables defined in 'columns_to_standardize'
+  # These variables are already z-scores in TOTAL_SCORES_final
+  summarise(across(all_of(columns_to_standardize), 
+                   list(Mean = ~mean(.x, na.rm = TRUE), SD = ~sd(.x, na.rm = TRUE)),
+                   .names = "{.col}_{.fn}"), .groups = "drop") %>%
+  # Pivot longer to make it easier to separate variable and statistic
+  pivot_longer(cols = -GROUP,
+               names_to = c("Variable", ".value"), # .value takes Mean and SD
+               names_pattern = "(.+)_(Mean|SD)") %>% # Regex to capture var name and stat
+  # Pivot wider to have SCZ_Mean, SCZ_SD, ASD_Mean, ASD_SD columns
+  pivot_wider(names_from = GROUP,
+              values_from = c(Mean, SD),
+              names_glue = "{GROUP}_{.value}") # Creates e.g. Schizophrenia_Mean
+
+# Ensure correct column order and naming for the final table
+# Adjust "Schizophrenia" if your factor level is different
+# Check if the pivoted columns exist before selecting
+expected_cols <- c("Variable", "Schizophrenia_Mean", "Schizophrenia_SD", "ASD_Mean", "ASD_SD")
+if (!all(expected_cols %in% names(descriptives_summary_std))) {
+    missing_cols <- expected_cols[!expected_cols %in% names(descriptives_summary_std)]
+    warning(paste("One or more expected columns are missing after pivoting:", paste(missing_cols, collapse=", "), 
+                ".This might be due to incorrect GROUP factor levels or issues in pivoting. Table will be incomplete."))
+    # Create missing columns with NA if they don't exist to prevent select error, though table will be wrong
+    for(mc in missing_cols) {
+      if (mc != "Variable") descriptives_summary_std[[mc]] <- NA_real_
+    }
+}
+
+
+descriptives_table_formatted_std <- descriptives_summary_std %>%
+  select(
+    Variable,
+    # Use one_of to avoid error if a column is missing due to no data for a group (though nrow checks should catch this)
+    `SCZ Mean (z)` = one_of("Schizophrenia_Mean"), 
+    `SCZ SD (z)` = one_of("Schizophrenia_SD"),   
+    `ASD Mean (z)` = one_of("ASD_Mean"),
+    `ASD SD (z)` = one_of("ASD_SD")
+  ) %>%
+  # Optional: Order variables as they appear in 'columns_to_standardize' for consistency
+  arrange(match(Variable, columns_to_standardize))
+
+# --- MODIFICATION: Use my_node_labels for the 'Variable' column ---
+# Ensure my_node_labels is defined (it should be from Step 3 of your main Rmd)
+if (!exists("my_node_labels")) {
+  stop("my_node_labels vector not found. Please ensure Step 3 of your R Markdown has been run and my_node_labels is defined.")
+}
+# Check if the length of my_node_labels matches the number of rows in the table
+# (which corresponds to the number of unique variables from columns_to_standardize)
+if (length(my_node_labels) != nrow(descriptives_table_formatted_std)) {
+  stop(paste("Length of my_node_labels (", length(my_node_labels), 
+             ") does not match the number of variables in the descriptive table (", 
+             nrow(descriptives_table_formatted_std), 
+             "). Check definitions of 'columns_to_standardize' and 'my_node_labels' in your R Markdown file.",
+             "Ensure 'columns_to_standardize' only contains variables intended for the table and 'my_node_labels' matches this set."))
+}
+# Replace the 'Variable' column with the desired labels.
+# This relies on the 'arrange(match(Variable, columns_to_standardize))' step above ensuring
+# that the rows in 'descriptives_table_formatted_std' are in the same order as 'columns_to_standardize',
+# and that 'my_node_labels' is defined in the same corresponding order as 'columns_to_standardize'.
+descriptives_table_formatted_std$Variable <- my_node_labels
+# --- END OF MODIFICATION ---
+
+
+# --- 4. Print the Formatted Table ---
+caption_text_std <- paste0("Descriptive Statistics for Network Variables (Standardized z-scores). SCZ Group (n=", 
+                           final_n_SCZ_std, "), ASD Group (n=", final_n_ASD_std, ").")
+
+kable(descriptives_table_formatted_std, 
+      caption = caption_text_std, 
+      digits = 2, # Adjust number of decimal places as needed
+      align = 'lcccc') # l for left align first col, c for center for the rest
+
+
+```
+
+```{r}
+scope_ASD <- scope %>% filter(GROUP == "ASD")
+
+scope_ASD <- scope_ASD %>%
+  select(all_of(columns_to_standardize), GROUP, Gender) %>% 
+  drop_na()
+
+scope_SCZ <- scope %>% filter(GROUP == "Schizophrenia")
+
+scope_SCZ <- scope_SCZ %>%
+  select(all_of(columns_to_standardize), GROUP, Gender) %>% 
+  drop_na()
+
+
+```
+
+
+#
+
+```{r}
+# Create a data frame for better presentation
+cs_table_data <- data.frame(
+  Group = rep(c("SCZ", "ASD"), each = 3),
+  Centrality = rep(c("Strength", "Closeness", "Betweenness"), times = 2),
+  CS_cor_0.7 = c(cs_SCZ["strength"],    # Access directly by name
+                 cs_SCZ["closeness"],   # Access directly by name
+                 cs_SCZ["betweenness"], # Access directly by name
+                 cs_ASD["strength"],    # Access directly by name
+                 cs_ASD["closeness"],   # Access directly by name
+                 cs_ASD["betweenness"]) # Access directly by name
+)
+
+# If cs_SCZ and cs_ASD are 1-row matrices, you might need:
+# CS_cor_0.7 = c(cs_SCZ[1, "strength"],
+#                  cs_SCZ[1, "closeness"],
+#                  cs_SCZ[1, "betweenness"],
+#                  cs_ASD[1, "strength"],
+#                  cs_ASD[1, "closeness"],
+#                  cs_ASD[1, "betweenness"])
+# However, direct naming usually works for named vectors or if the data frame has those as column names.
+# Given your print output, direct access by name should work.
+
+# Print the table using kable (from knitr package, usually loaded with tidyverse or rmarkdown)
+if (!requireNamespace("knitr", quietly = TRUE)) { # Check if knitr is installed
+  install.packages("knitr")
+}
+library(knitr)
+kable(cs_table_data, caption = "Correlation Stability (CS) Coefficients for Centrality Measures", digits = 3) # Increased digits for precision
+```
+```{r}
+check_all_columns_normality(Data_ASD, "ASD")
+```
+
+```{r}
+# Assuming node names in the bootnet output match the order of my_node_labels
+# or you have mapped them appropriately.
+# The 'names()' attribute of the centrality vectors from bootnet$sample 
+# will likely be the full variable names.
+# You'd get the actual full variable names from colnames(Data_SCZ_prepared)
+# and then map them to my_node_labels.
+
+# For demonstration, let's assume the order from bootnet output is correct and matches my_node_labels
+# or that qgraph::centrality_auto(network_SCZ$graph)$node.centrality provides a dataframe
+# with row names that can be mapped or are already the short labels.
+
+# Example using hypothetical extraction (actual extraction might need more steps for name alignment)
+# This is a simplified placeholder for the actual extraction and mapping.
+
+# Get node names (full variable names) from one of the network objects
+node_names_full_scz <- colnames(Data_SCZ_prepared) 
+node_names_full_asd <- colnames(Data_ASD_prepared)
+
+# Map full names to my_node_labels (ensure my_node_labels corresponds to the *final* set of 15 variables)
+# This map assumes 'network_vars' from Step 3 (before filtering) and the initial 'my_node_labels'
+# were correctly aligned, and then filtered consistently.
+# The script sets network_vars in Step 7 to be the 15 variables:
+# network_vars <- c("PS1_Tot", ..., "AIHQ_Blame") (15 vars)
+# my_node_labels (15 labels) are also used for plotting these.
+
+# Correct approach: Centrality results from bootnet will have node IDs (usually numbers 1:N)
+# or full variable names as labels. The bootnet object plot methods use 'labels' argument.
+# The summary(boot_SCZ_edges_and_centrality, "strength") will show values with labels.
+
+# Let's assume you get data frames like this from centrality_auto or by processing bootnet output:
+# centrality_scz_df <- data.frame(Node = my_node_labels,
+# Strength = extracted_strength_scz_values,
+# Closeness = extracted_closeness_scz_values,
+# Betweenness = extracted_betweenness_scz_values)
+# centrality_scz_df$Group <- "SCZ"
+
+# A more robust way is to use centrality_auto from qgraph on the estimated graphs
+library(qgraph) # Ensure loaded
+
+# Get centrality for SCZ network
+centrality_scz_raw <- centrality_auto(network_SCZ$graph)
+centrality_scz_df <- data.frame(
+    Node = my_node_labels, # Assumes order from centrality_auto matches my_node_labels
+    Strength = centrality_scz_raw$node.centrality$Strength,
+    Betweenness = centrality_scz_raw$node.centrality$Betweenness,
+    Closeness = centrality_scz_raw$node.centrality$Closeness,
+    Group = "SCZ"
+)
+
+# Get centrality for ASD network
+centrality_asd_raw <- centrality_auto(network_ASD$graph)
+centrality_asd_df <- data.frame(
+    Node = my_node_labels, # Assumes order from centrality_auto matches my_node_labels
+    Strength = centrality_asd_raw$node.centrality$Strength,
+    Betweenness = centrality_asd_raw$node.centrality$Betweenness,
+    Closeness = centrality_asd_raw$node.centrality$Closeness,
+    Group = "ASD"
+)
+
+combined_centrality_df <- rbind(centrality_scz_df, centrality_asd_df)
+
+final_centrality_df <- combined_centrality_df[, c("Group", "Node", "Strength", "Betweenness", "Closeness")]
+
+write.csv(final_centrality_df, "centrality_table_asd_scz.csv", row.names = FALSE)
+```
+
