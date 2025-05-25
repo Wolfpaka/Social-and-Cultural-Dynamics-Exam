@@ -1,0 +1,1 @@
+# Social-and-Cultural-Dynamics-Exam
